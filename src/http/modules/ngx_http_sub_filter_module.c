@@ -237,23 +237,13 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
         while (ctx->pos < ctx->buf->last) {
 
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "saved: \"%V\" state: %d", &ctx->saved, ctx->state);
-
             rc = ngx_http_sub_parse(r, ctx);
-
-            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "parse: %d, looked: \"%V\" %p-%p",
-                           rc, &ctx->looked, ctx->copy_start, ctx->copy_end);
 
             if (rc == NGX_ERROR) {
                 return rc;
             }
 
             if (ctx->copy_start != ctx->copy_end) {
-
-                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "saved: \"%V\"", &ctx->saved);
 
                 if (ctx->saved.len) {
 
@@ -610,7 +600,9 @@ ngx_http_sub_parse(ngx_http_request_t *r, ngx_http_sub_ctx_t *ctx)
     ctx->pos = p;
     ctx->looked.len = looked;
 
-    ctx->copy_end = (state == sub_start_state) ? p : copy_end;
+    /* Redundant
+     * ctx->copy_end = (state == sub_start_state) ? p : copy_end;
+     */
 
     if (ctx->copy_start == NULL && ctx->copy_end) {
         ctx->copy_start = ctx->buf->pos;
