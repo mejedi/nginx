@@ -4,6 +4,27 @@
  * Copyright (C) Nginx, Inc.
  */
 
+/*
+ * Though it is compeling to play clever i.e. to avoid memcpy as much as
+ * possible and to reuse parts of input buffers in the output chain it
+ * makes the code unnecessary hard to debug and maintain.  For this
+ * reasons we write output to the new (recycled) buffer.  We believe
+ * that the cost of pattern matching exceeds memcpy overhead.
+ *
+ * In order to perform pattern matching we need a sliding window over
+ * the input.  Matching algorithm may save and restore positions
+ * effectively passing multiple times over the same byte evaluating
+ * different possibilities.  It is too inconvenient to get concerned
+ * with buffer boundaries or to accomodate for multiple data sources
+ * (i.e. current buffer/a copy of the previous buffer).  For this reasons
+ * we first copy a portion of input to the circular buffer and run
+ * matching algorithm on the circular buffer.
+ *
+ * Matching algorithm is a simplified variant of FSM-driven regex
+ * search.  Only literal patterns are supported.
+ *
+ * nickz
+ */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
