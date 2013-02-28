@@ -93,10 +93,9 @@ typedef struct {
 
 
 struct ngx_http_sub_fsm_s {
-    size_t                    edges_num;
-    ngx_http_sub_fsm_t      **edge_ptrs;
-    int                       match_idx;
-    u_char                    edge_chars[1];
+    int                        match_idx;
+    u_char                     dispatch[256];
+    ngx_http_sub_fsm_t        *links[1];
 };
 
 
@@ -319,8 +318,7 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
         case search_state:
             {
-                u_char c = ngx_tolower(ctx->cb_p[ctx->search_pos & ctx->cb_mask]);
-                u_char *p;
+                int i;
 
                 while (1) {
                     if (ctx->search_pos == ctx->cb_end) {
@@ -332,11 +330,11 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                         break;
                     }
 
-                    p = memchr(ctx->fsm->edge_chars, c, ctx->fsm->edges_num);
+                    i = ctx->fsm->dispatch[ctx->cb_p[ctx->search_pos & ctx->cb_mask]];
+                    ctx->fsm = ctx->fsm->links[i];
                     ctx->search_pos++;
-                    c = ngx_tolower(ctx->cb_p[ctx->search_pos & ctx->cb_mask]);
-                    if (p) {
-                        ctx->fsm = ctx->fsm->edge_ptrs[p - ctx->fsm->edge_chars];
+
+                    if (i > 0) {
                         if (ctx->fsm->match_idx != -1) {
                             ctx->match_pos = ctx->search_pos;
                             ctx->match_idx = ctx->fsm->match_idx;
@@ -346,7 +344,6 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                             ctx->s = replace_state;
                             break;
                         }
-                        ctx->fsm = slcf->fsm;
                     }
                 }
                 continue;
@@ -569,25 +566,22 @@ ngx_http_sub_merge_conf(ngx_conf_t *cf, void *parent, void *child)
         ngx_http_sub_fsm_t *sm, **ss = &conf->fsm;
 
         while (1) {
-            *ss = sm = ngx_pcalloc(cf->pool, offsetof(ngx_http_sub_fsm_t, edge_chars) + 2);
+            *ss = sm = ngx_pcalloc(cf->pool, offsetof(ngx_http_sub_fsm_t, links) + sizeof(void *)*2);
             if (!sm) {
                 return NGX_CONF_ERROR;
             }
-
-            sm->edge_ptrs = ngx_pcalloc(cf->pool, 2 * sizeof(*sm->edge_ptrs));
-            if (!sm->edge_ptrs) {
-                return NGX_CONF_ERROR;
-            }
+            sm->links[0] = conf->fsm;
+            sm->match_idx = -1;
 
             if (p == e) {
-                sm->edges_num = 0;
                 sm->match_idx = 0;
                 break;
             } else {
-                sm->match_idx = -1;
-                sm->edges_num = 1;
-                sm->edge_chars[0] = *p++;
-                ss = &sm->edge_ptrs[0];
+                sm->dispatch[*p] = 1;
+                sm->dispatch[ngx_tolower(*p)] = 1;
+                sm->dispatch[ngx_toupper(*p)] = 1;
+                p++;
+                ss = &sm->links[1];
             }
         }
 
