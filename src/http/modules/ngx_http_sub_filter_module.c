@@ -55,6 +55,7 @@ typedef enum {
     init_state,
     accumulate_state,
     search_state,
+    fast_search_state,
     trim_cb_state,
     replace_state,
     repl_write_state,
@@ -340,12 +341,28 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                             ctx->match_idx = ctx->fsm->match_idx;
                         }
                     } else {
-                        if (ctx->match_idx != -1) {
-                            ctx->s = replace_state;
-                            break;
-                        }
+                        ctx->s = (ctx->match_idx == -1 ? fast_search_state : replace_state);
+                        break;
                     }
                 }
+                continue;
+            }
+        case fast_search_state:
+            {
+                /* searching linear memory */
+                u_char *base = &ctx->cb_p[ctx->search_pos & ctx->cb_mask];
+                u_char *i = base;
+                u_char *m = ctx->fsm->dispatch;
+
+                size_t remaining = ctx->cb_end - ctx->search_pos;
+                size_t cont = ((ctx->search_pos + ctx->cb_mask) & ~ctx->cb_mask) - ctx->search_pos;
+                u_char *e = base + (remaining <= cont ? remaining : cont);
+
+                while (i<e && !m[*i]) {
+                    i++;
+                }
+                ctx->search_pos += (i - base);
+                ctx->s = search_state;
                 continue;
             }
         case trim_cb_state:
