@@ -410,10 +410,11 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 if (!slcf->once) {
                     ctx->search_pos = ctx->cb_begin;
                     ctx->match_idx = -1;
-                    ctx->fsm = slcf->fsm;
                     ctx->s = accumulate_state;
                     continue;
                 }
+
+                ctx->s = flush_cb_state;
             }
             /* fallthrough */
         case flush_cb_state:
