@@ -89,6 +89,8 @@ typedef struct {
     u_char                    *repl_end;
 
     ngx_chain_t               *in;
+    ngx_chain_t              **last_in;
+    ngx_chain_t               *free;
     ngx_chain_t                out;
     ngx_buf_t                  obuf;
     int                        busy;
@@ -228,6 +230,7 @@ ngx_http_sub_header_filter(ngx_http_request_t *r)
     ctx->fsm = slcf->fsm;
     ctx->match_idx = -1;
 
+    ctx->last_in = &ctx->in;
     ctx->out.buf = &ctx->obuf;
     ctx->obuf.memory = 1;
     ctx->obuf.recycled = 1;
@@ -268,9 +271,27 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     /* add the incoming chain to the chain ctx->in */
 
     if (in) {
-        if (ngx_chain_add_copy(r->pool, &ctx->in, in) != NGX_OK) {
-            return NGX_ERROR;
+        ngx_chain_t  *cl, **ll = ctx->last_in;
+
+        while (in) {
+            if (ctx->free) {
+                cl = ctx->free;
+                ctx->free = cl->next;
+
+            } else {
+                cl = ngx_alloc_chain_link(r->pool);
+                if (cl == NULL) {
+                    return NGX_ERROR;
+                }
+            }
+            cl->buf = in->buf;
+            *ll = cl;
+            ll = &cl->next;
+            in = in->next;
         }
+
+        *ll = NULL;
+        ctx->last_in = ll;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
@@ -318,11 +339,14 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 }
 
                 if (avail == 0) {
-                    /* FIXME reuse chain link */
-                    ctx->in->buf->pos = ctx->in->buf->last;
-                    ctx->in = ctx->in->next;
+                    ngx_chain_t *cl = ctx->in;
+                    cl->buf->pos = cl->buf->last;
+                    ctx->in = cl->next;
+                    cl->next = ctx->free;
+                    ctx->free = cl;
 
                     if (!ctx->in) {
+                        ctx->last_in = &ctx->in;
                         ctx->s = init_state;
                         return NGX_OK;
                     }
