@@ -100,6 +100,10 @@ typedef struct {
 
 
 struct ngx_http_sub_fsm_s {
+#if NGX_DEBUG
+    int                        id;
+#define NGX_HTTP_SUB_FSM_ID 1
+#endif
     int                        match_idx;
     u_char                     dispatch[256];
     ngx_http_sub_fsm_t        *links[1];
@@ -718,6 +722,7 @@ typedef struct {
     ngx_http_sub_meta_t       *meta;
 #define NGX_HTTP_SUB_COMPILE_BUCKETS 113
     ngx_http_sub_info_t       *buckets[NGX_HTTP_SUB_COMPILE_BUCKETS];
+    int                        next_fsm_id;
     u_char                     bitmap[256];
 
 } ngx_http_sub_compile_t;
@@ -791,9 +796,18 @@ ngx_http_sub_compile2(ngx_http_sub_compile_t *c, ngx_http_sub_fsm_t **pfsm)
     }
 
     /* init fsm */
+#ifdef NGX_HTTP_SUB_FSM_ID
+    fsm->id = c->next_fsm_id++;
+#endif
     fsm->match_idx = match_idx;
     fsm->links[0] = c->fsm;
     n_links = 1;
+
+#if NGX_DEBUG
+    if (match_idx != -1) {
+        fprintf(stderr, "%d[shape=doublecircle];\n", fsm->id);
+    }
+#endif
 
     /* init dispatch table */
     for (i = 0; i< 256; i++) {
@@ -825,8 +839,9 @@ ngx_http_sub_compile2(ngx_http_sub_compile_t *c, ngx_http_sub_fsm_t **pfsm)
                     c, &fsm->links[fsm->dispatch[i]]) != NGX_OK) {
                 return NGX_ERROR;
             }
-
-            fprintf(stderr, "%"PRIdPTR"->%"PRIdPTR" [label=%c]\n", fsm, fsm->links[fsm->dispatch[i]], i);
+#if NGX_DEBUG
+            fprintf(stderr, "%d->%d [label=%c];\n", fsm->id, fsm->links[fsm->dispatch[i]]->id, (int)i);
+#endif
         }
     }
 
@@ -865,13 +880,17 @@ ngx_http_sub_compile(ngx_conf_t *conf, ngx_str_t *patterns, size_t n)
         c.meta->slots[i].pos = 0;
     }
 
-    fprintf(stderr, "digraph D {\n");
+#if NGX_DEBUG
+    fprintf(stderr, "digraph D {\nnode[shape=circle];\n");
+#endif
 
     if (ngx_http_sub_compile2(&c, &c.fsm) != NGX_OK) {
         return NULL;
     }
 
+#if NGX_DEBUG
     fprintf(stderr, "}\n");
+#endif
 
     return c.fsm;
 }
