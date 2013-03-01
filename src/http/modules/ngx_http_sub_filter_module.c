@@ -115,6 +115,7 @@ struct ngx_http_sub_fsm_s {
 (offsetof(ngx_http_sub_fsm_t, links) \
     + (n) * sizeof(ngx_http_sub_fsm_t *))
 
+
 static ngx_http_sub_fsm_t *ngx_http_sub_compile(ngx_conf_t *conf,
     ngx_str_t *patterns, size_t n);
 
@@ -398,6 +399,7 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
                 size_t cont = ((ctx->search_pos + ctx->cb_mask) & ~ctx->cb_mask) - ctx->search_pos;
                 u_char *e = base + (remaining <= cont ? remaining : cont);
 
+                /* the hotspot */
                 while (i<e && !m[*i]) {
                     i++;
                 }
@@ -627,12 +629,11 @@ ngx_http_sub_create_conf(ngx_conf_t *cf)
     /*
      * set by ngx_pcalloc():
      *
-     *     conf->match = { 0, NULL };
-     *     conf->sub = { 0, NULL };
-     *     conf->sub_lengths = NULL;
-     *     conf->sub_values = NULL;
+     *     conf->matches = NULL;
      *     conf->types = { NULL };
      *     conf->types_keys = NULL;
+     *     conf->fsm = NULL;
+     *     conf->match_max = 0;
      */
 
     slcf->once = NGX_CONF_UNSET;
