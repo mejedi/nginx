@@ -38,6 +38,12 @@ typedef struct {
     ngx_str_t                  match;
     ngx_http_complex_value_t   value;
 
+} ngx_http_sub_match_t;
+
+
+typedef struct {
+    ngx_array_t               *matches; /* ngx_http_sub_match_t */
+
     ngx_hash_t                 types;
 
     ngx_flag_t                 once;
@@ -88,7 +94,7 @@ typedef struct {
     int                        busy;
     ngx_int_t                  rc;
 
-    ngx_str_t                  sub;
+    ngx_str_t                 *subs;
 
 } ngx_http_sub_ctx_t;
 
@@ -384,24 +390,34 @@ ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
             }
         case replace_state:
             {
-                size_t end_pos = ctx->match_pos - slcf->match.len;
+                int match_idx = ctx->match_idx;
+                ngx_http_sub_match_t *m = slcf->matches->elts;
+                size_t end_pos = ctx->match_pos - m[match_idx].match.len;
 
                 if (!ngx_http_sub_output_cb(r, ctx, end_pos)) {
                     return ctx->rc;
                 }
                 ctx->cb_begin = ctx->match_pos;
 
-                if (!ctx->sub.data)
+                if (!ctx->subs) {
+                    size_t sz = slcf->matches->nelts * sizeof(ngx_str_t);
+                    ctx->subs = ngx_pcalloc(r->pool, sz);
+                    if (!ctx->subs) {
+                        return NGX_ERROR;
+                    }
+                }
+
+                if (!ctx->subs[match_idx].data)
                 {
                     if (ngx_http_complex_value(
-                            r, &slcf->value, &ctx->sub) != NGX_OK) {
+                            r, &m[match_idx].value, &ctx->subs[match_idx]) != NGX_OK) {
                         return NGX_ERROR;
                     }
                 }
 
                 ctx->s = repl_write_state;
-                ctx->repl_begin = ctx->sub.data;
-                ctx->repl_end = ctx->sub.data + ctx->sub.len;
+                ctx->repl_begin = ctx->subs[match_idx].data;
+                ctx->repl_end = ctx->repl_begin + ctx->subs[match_idx].len;
             }
             /* fallthrough */
         case repl_write_state:
@@ -522,24 +538,45 @@ ngx_http_sub_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_sub_loc_conf_t *slcf = conf;
 
+    ngx_array_t                       *matches;
+    ngx_http_sub_match_t              *m;
+    size_t                             i;
     ngx_str_t                         *value;
     ngx_http_compile_complex_value_t   ccv;
 
-    if (slcf->match.data) {
-        return "is duplicate";
+    matches = slcf->matches;
+    if (matches == NULL) {
+        matches = ngx_array_create(cf->pool, 1, sizeof(ngx_http_sub_match_t));
+        if (matches == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        slcf->matches = matches;
     }
 
     value = cf->args->elts;
 
     ngx_strlow(value[1].data, value[1].data, value[1].len);
 
-    slcf->match = value[1];
+    m = matches->elts;
+    for (i = 0; i < matches->nelts; i++) {
+        if (m[i].match.len == value[1].len
+            && memcmp(m[i].match.data, value[1].data, value[1].len)==0) {
+            return "is duplicate";
+        }
+    }
+
+    m = ngx_array_push(matches);
+    if (!m) {
+        return NGX_CONF_ERROR;
+    }
+
+    m->match = value[1];
 
     ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
 
     ccv.cf = cf;
     ccv.value = &value[2];
-    ccv.complex_value = &slcf->value;
+    ccv.complex_value = &m->value;
 
     if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
         return NGX_CONF_ERROR;
@@ -583,18 +620,34 @@ ngx_http_sub_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_sub_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->once, prev->once, 1);
-    ngx_conf_merge_str_value(conf->match, prev->match, "");
 
-    if (conf->match.len != 0) {
-        conf->match_max = conf->match.len;
-        conf->fsm = ngx_http_sub_compile(cf, &conf->match, 1);
+    if (!conf->matches && prev->matches) {
+        conf->matches = prev->matches;
+    }
+
+    if (conf->matches) {
+        ngx_array_t *matches = conf->matches;
+        ngx_str_t *patterns;
+        ngx_http_sub_match_t *m;
+        size_t i;
+
+        patterns = ngx_palloc(cf->temp_pool, matches->nelts * sizeof(ngx_str_t));
+        if (!patterns) {
+            return NGX_CONF_ERROR;
+        }
+
+        m = matches->elts;
+        for (i = 0; i < matches->nelts; i++) {
+            patterns[i] = m[i].match;
+            if (m[i].match.len > conf->match_max) {
+                conf->match_max = m[i].match.len;
+            }
+        }
+
+        conf->fsm = ngx_http_sub_compile(cf, patterns, matches->nelts);
         if (!conf->fsm) {
             return NGX_CONF_ERROR;
         }
-    }
-
-    if (conf->value.value.data == NULL) {
-        conf->value = prev->value;
     }
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
