@@ -99,6 +99,12 @@ struct ngx_http_sub_fsm_s {
     ngx_http_sub_fsm_t        *links[1];
 };
 
+#define NGX_HTTP_SUB_FSM_SIZE(n) \
+(offsetof(ngx_http_sub_fsm_t, links) \
+    + (n) * sizeof(ngx_http_sub_fsm_t *))
+
+static ngx_http_sub_fsm_t *ngx_http_sub_compile(ngx_conf_t *conf,
+    ngx_str_t *patterns, size_t n);
 
 static size_t ngx_http_sub_output(ngx_http_request_t *r,
     ngx_http_sub_ctx_t *ctx, u_char *p, size_t sz);
@@ -183,7 +189,7 @@ ngx_http_sub_header_filter(ngx_http_request_t *r)
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_sub_filter_module);
 
-    if (slcf->match.len == 0
+    if (slcf->fsm == NULL
         || r->headers_out.content_length_n == 0
         || ngx_http_test_content_type(r, &slcf->types) == NULL)
     {
@@ -580,30 +586,11 @@ ngx_http_sub_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_str_value(conf->match, prev->match, "");
 
     if (conf->match.len != 0) {
-        u_char *p = conf->match.data, *e = p + conf->match.len;
-        ngx_http_sub_fsm_t *sm, **ss = &conf->fsm;
-
-        while (1) {
-            *ss = sm = ngx_pcalloc(cf->pool, offsetof(ngx_http_sub_fsm_t, links) + sizeof(void *)*2);
-            if (!sm) {
-                return NGX_CONF_ERROR;
-            }
-            sm->links[0] = conf->fsm;
-            sm->match_idx = -1;
-
-            if (p == e) {
-                sm->match_idx = 0;
-                break;
-            } else {
-                sm->dispatch[*p] = 1;
-                sm->dispatch[ngx_tolower(*p)] = 1;
-                sm->dispatch[ngx_toupper(*p)] = 1;
-                p++;
-                ss = &sm->links[1];
-            }
-        }
-
         conf->match_max = conf->match.len;
+        conf->fsm = ngx_http_sub_compile(cf, &conf->match, 1);
+        if (!conf->fsm) {
+            return NGX_CONF_ERROR;
+        }
     }
 
     if (conf->value.value.data == NULL) {
@@ -632,4 +619,206 @@ ngx_http_sub_filter_init(ngx_conf_t *cf)
     ngx_http_top_body_filter = ngx_http_sub_body_filter;
 
     return NGX_OK;
+}
+
+
+/*
+ * FSM compiler
+ */
+
+typedef struct {
+    int                        idx;
+    int                        pos;
+
+} ngx_http_sub_meta_slot_t;
+
+
+typedef struct {
+    size_t                     len;
+    ngx_http_sub_meta_slot_t   slots[1];
+
+} ngx_http_sub_meta_t;
+
+#define NGX_HTTP_SUB_META_SIZE(n) \
+(offsetof(ngx_http_sub_meta_t, slots) \
+    + (n) * sizeof(ngx_http_sub_meta_slot_t))
+
+
+typedef struct ngx_http_sub_info_s {
+    ngx_http_sub_fsm_t        *fsm;
+    struct ngx_http_sub_info_s
+                              *next;
+    uint32_t                   meta_hash;
+    ngx_http_sub_meta_t        meta;
+
+} ngx_http_sub_info_t;
+
+#define NGX_HTTP_SUB_INFO_SIZE(m) \
+(offsetof(ngx_http_sub_info_t, meta) \
+    + NGX_HTTP_SUB_META_SIZE((m)->len))
+
+
+typedef struct {
+    ngx_conf_t                *conf;
+    ngx_str_t                 *patterns;
+    ngx_http_sub_fsm_t        *fsm;
+    ngx_http_sub_meta_t       *meta;
+#define NGX_HTTP_SUB_COMPILE_BUCKETS 113
+    ngx_http_sub_info_t       *buckets[NGX_HTTP_SUB_COMPILE_BUCKETS];
+    u_char                     bitmap[256];
+
+} ngx_http_sub_compile_t;
+
+
+static ngx_int_t
+ngx_http_sub_compile2(ngx_http_sub_compile_t *c, ngx_http_sub_fsm_t **pfsm)
+{
+    size_t i;
+    ngx_http_sub_info_t *info, **pi;
+    uint32_t meta_hash;
+    int pos_filter = 0;
+    int match_idx = -1;
+    size_t n_links = 1;
+    ngx_http_sub_fsm_t *fsm;
+
+    meta_hash = ngx_murmur_hash2(
+        (u_char *)c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len));
+
+    /* search for existing fsm */
+    pi = &c->buckets[meta_hash % NGX_HTTP_SUB_COMPILE_BUCKETS];
+    info = *pi;
+    while (info) {
+        if (info->meta_hash == meta_hash
+            && memcmp(&info->meta, c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len))==0) {
+
+            *pfsm = info->fsm;
+            return NGX_OK;
+        }
+        pi = &info->next;
+        info = info->next;
+    }
+
+    /* build new fsm */
+    *pi = info = ngx_palloc(c->conf->temp_pool, NGX_HTTP_SUB_INFO_SIZE(c->meta));
+    if (!info) {
+        return NGX_ERROR;
+    }
+
+    info->meta_hash = meta_hash;
+    memcpy(&info->meta, c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len));
+
+    /* check if there is a match in the current state */
+    for (i = 0; i < info->meta.len; i++) {
+        ngx_http_sub_meta_slot_t slot = info->meta.slots[i];
+        if (slot.pos == c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+            match_idx = slot.idx;
+            pos_filter = slot.pos;
+        }
+    }
+
+    /* find accepted characters */
+    memset(c->bitmap, 0, sizeof c->bitmap);
+    for (i = 0; i < info->meta.len; i++) {
+        ngx_http_sub_meta_slot_t slot = info->meta.slots[i];
+        if (slot.pos != c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+            c->bitmap[c->patterns[slot.idx].data[slot.pos]] = 1;
+        }
+    }
+
+    /* count outgoing links */
+    for (i = 0; i < 256; i++) {
+        n_links += c->bitmap[i];
+    }
+
+    /* allocate fsm */
+    fsm = ngx_pcalloc(c->conf->pool, NGX_HTTP_SUB_FSM_SIZE(n_links));
+    *pfsm = info->fsm = fsm;
+    if (!fsm) {
+        return NGX_ERROR;
+    }
+
+    /* init fsm */
+    fsm->match_idx = match_idx;
+    fsm->links[0] = c->fsm;
+    n_links = 1;
+
+    /* init dispatch table */
+    for (i = 0; i< 256; i++) {
+        if (c->bitmap[i]) {
+            fsm->dispatch[i] = n_links++;
+        }
+    }
+
+    /* init links */
+    for (i = 0; i< 256; i++) {
+        if (fsm->dispatch[i]) {
+            size_t j;
+
+            c->meta->len = 0;
+            for (j = 0; j < info->meta.len; j++) {
+                ngx_http_sub_meta_slot_t slot = info->meta.slots[j];
+                if (slot.pos != c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+                    if (slot.pos == 0) {
+                        c->meta->slots[c->meta->len++] = slot;
+                    }
+                    if (c->patterns[slot.idx].data[slot.pos] == i) {
+                        ngx_http_sub_meta_slot_t slot2 = {slot.idx, slot.pos + 1};
+                        c->meta->slots[c->meta->len++] = slot2;
+                    }
+                }
+            }
+
+            if (ngx_http_sub_compile2(
+                    c, &fsm->links[fsm->dispatch[i]]) != NGX_OK) {
+                return NGX_ERROR;
+            }
+
+            fprintf(stderr, "%"PRIdPTR"->%"PRIdPTR" [label=%c]\n", fsm, fsm->links[fsm->dispatch[i]], i);
+        }
+    }
+
+    /* modify dispatch table for case-insensitive matching */
+    for (i = 0; i< 256; i++) {
+        if (fsm->dispatch[i]) {
+            fsm->dispatch[ngx_tolower(i)] = fsm->dispatch[i];
+            fsm->dispatch[ngx_toupper(i)] = fsm->dispatch[i];
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_http_sub_fsm_t *
+ngx_http_sub_compile(ngx_conf_t *conf, ngx_str_t *patterns, size_t n)
+{
+    ngx_http_sub_compile_t c = {conf, patterns};
+
+    size_t slots_max = n;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        slots_max += patterns[i].len;
+    }
+
+    c.meta = ngx_palloc(conf->temp_pool, NGX_HTTP_SUB_META_SIZE(slots_max));
+    if (!c.meta) {
+        return NULL;
+    }
+
+    c.meta->len = n;
+    for (i = 0; i < n; i++) {
+        c.meta->slots[i].idx = i;
+        c.meta->slots[i].pos = 0;
+    }
+
+    fprintf(stderr, "digraph D {\n");
+
+    if (ngx_http_sub_compile2(&c, &c.fsm) != NGX_OK) {
+        return NULL;
+    }
+
+    fprintf(stderr, "}\n");
+
+    return c.fsm;
 }
