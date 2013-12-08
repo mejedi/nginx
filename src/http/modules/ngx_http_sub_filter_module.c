@@ -4,59 +4,125 @@
  * Copyright (C) Nginx, Inc.
  */
 
+/*
+ * Though it is compeling to play clever i.e. to avoid memcpy as much as
+ * possible and to reuse parts of input buffers in the output chain it
+ * makes the code unnecessary hard to debug and maintain.  For this
+ * reasons we write output to the new (recycled) buffer.  We believe
+ * that the cost of pattern matching exceeds memcpy overhead.
+ *
+ * In order to perform pattern matching we need a sliding window over
+ * the input.  Matching algorithm may save and restore positions
+ * effectively passing multiple times over the same byte evaluating
+ * different possibilities.  It is too inconvenient to get concerned
+ * with buffer boundaries or to accomodate for multiple data sources
+ * (i.e. current buffer/a copy of the previous buffer).  For this reasons
+ * we first copy a portion of input to the circular buffer and run
+ * matching algorithm on the circular buffer.
+ *
+ * Matching algorithm is a simplified variant of FSM-driven regex
+ * search.  Only literal patterns are supported.
+ *
+ * nickz
+ */
 
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
 
 
+typedef struct ngx_http_sub_fsm_s  ngx_http_sub_fsm_t;
+
+
 typedef struct {
     ngx_str_t                  match;
     ngx_http_complex_value_t   value;
+
+} ngx_http_sub_match_t;
+
+
+typedef struct {
+    ngx_array_t               *matches; /* ngx_http_sub_match_t */
 
     ngx_hash_t                 types;
 
     ngx_flag_t                 once;
 
     ngx_array_t               *types_keys;
+
+    ngx_http_sub_fsm_t        *fsm;
+    size_t                     match_max;
+
 } ngx_http_sub_loc_conf_t;
 
 
 typedef enum {
-    sub_start_state = 0,
-    sub_match_state,
-} ngx_http_sub_state_e;
+
+    init_state,
+    accumulate_state,
+    search_state,
+    fast_search_state,
+    trim_cb_state,
+    replace_state,
+    repl_write_state,
+    flush_cb_state,
+    final_state
+
+} ngx_http_sub_state_t;
 
 
 typedef struct {
-    ngx_str_t                  match;
-    ngx_str_t                  saved;
-    ngx_str_t                  looked;
+    /* circular buffer-fu */
+    u_char                    *cb_p;
+    size_t                     cb_begin;
+    size_t                     cb_end;
+    size_t                     cb_mask;
 
-    ngx_uint_t                 once;   /* unsigned  once:1 */
-
-    ngx_buf_t                 *buf;
-
-    u_char                    *pos;
-    u_char                    *copy_start;
-    u_char                    *copy_end;
+    /* state */
+    int                        s;
+    u_char                    *in_pos;
+    size_t                     search_pos;
+    ngx_http_sub_fsm_t        *fsm;
+    int                        match_idx; /* -1: no match */
+    size_t                     match_pos;
+    u_char                    *repl_begin;
+    u_char                    *repl_end;
 
     ngx_chain_t               *in;
-    ngx_chain_t               *out;
-    ngx_chain_t              **last_out;
-    ngx_chain_t               *busy;
+    ngx_chain_t              **last_in;
     ngx_chain_t               *free;
+    ngx_chain_t                out;
+    ngx_buf_t                  obuf;
+    int                        busy;
+    ngx_int_t                  rc;
 
-    ngx_str_t                  sub;
+    ngx_str_t                 *subs;
 
-    ngx_uint_t                 state;
 } ngx_http_sub_ctx_t;
 
 
-static ngx_int_t ngx_http_sub_output(ngx_http_request_t *r,
-    ngx_http_sub_ctx_t *ctx);
-static ngx_int_t ngx_http_sub_parse(ngx_http_request_t *r,
-    ngx_http_sub_ctx_t *ctx);
+struct ngx_http_sub_fsm_s {
+#if NGX_DEBUG
+    int                        id;
+#define NGX_HTTP_SUB_FSM_ID 1
+#endif
+    int                        match_idx;
+    u_char                     dispatch[256];
+    ngx_http_sub_fsm_t        *links[1];
+};
+
+#define NGX_HTTP_SUB_FSM_SIZE(n) \
+(offsetof(ngx_http_sub_fsm_t, links) \
+    + (n) * sizeof(ngx_http_sub_fsm_t *))
+
+
+static ngx_http_sub_fsm_t *ngx_http_sub_compile(ngx_conf_t *conf,
+    ngx_str_t *patterns, size_t n);
+
+static size_t ngx_http_sub_output(ngx_http_request_t *r,
+    ngx_http_sub_ctx_t *ctx, u_char *p, size_t sz);
+static int ngx_http_sub_output_cb(ngx_http_request_t *r,
+    ngx_http_sub_ctx_t *ctx, size_t end_pos);
 
 static char * ngx_http_sub_filter(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
@@ -136,7 +202,7 @@ ngx_http_sub_header_filter(ngx_http_request_t *r)
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_sub_filter_module);
 
-    if (slcf->match.len == 0
+    if (slcf->fsm == NULL
         || r->headers_out.content_length_n == 0
         || ngx_http_test_content_type(r, &slcf->types) == NULL)
     {
@@ -148,22 +214,38 @@ ngx_http_sub_header_filter(ngx_http_request_t *r)
         return NGX_ERROR;
     }
 
-    ctx->saved.data = ngx_pnalloc(r->pool, slcf->match.len);
-    if (ctx->saved.data == NULL) {
-        return NGX_ERROR;
+    size_t sz = 512;
+    while (sz < slcf->match_max * 4) {
+        sz *= 2;
     }
 
-    ctx->looked.data = ngx_pnalloc(r->pool, slcf->match.len);
-    if (ctx->looked.data == NULL) {
+    ctx->cb_p = ngx_pnalloc(r->pool, sz);
+    if (!ctx->cb_p) {
         return NGX_ERROR;
     }
+    ctx->cb_mask = sz-1;
+    ctx->cb_begin = ctx->cb_end = -100; /* test wrap around */
+
+    ctx->s = init_state;
+    ctx->search_pos = ctx->cb_begin;
+    ctx->fsm = slcf->fsm;
+    ctx->match_idx = -1;
+
+    ctx->last_in = &ctx->in;
+    ctx->out.buf = &ctx->obuf;
+    ctx->obuf.memory = 1;
+    ctx->obuf.recycled = 1;
+    ctx->obuf.start = ngx_pnalloc(r->pool, 0x10000);
+    if (!ctx->obuf.start) {
+        return NGX_ERROR;
+    }
+    ctx->obuf.end = ctx->obuf.start + 0x10000;
+    ctx->obuf.pos = ctx->obuf.last = ctx->obuf.start;
 
     ngx_http_set_ctx(r, ctx, ngx_http_sub_filter_module);
 
-    ctx->match = slcf->match;
-    ctx->last_out = &ctx->out;
-
     r->filter_need_in_memory = 1;
+    r->buffered |= NGX_HTTP_SUB_BUFFERED;
 
     if (r == r->main) {
         ngx_http_clear_content_length(r);
@@ -178,445 +260,306 @@ ngx_http_sub_header_filter(ngx_http_request_t *r)
 static ngx_int_t
 ngx_http_sub_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    ngx_int_t                  rc;
-    ngx_buf_t                 *b;
-    ngx_chain_t               *cl;
     ngx_http_sub_ctx_t        *ctx;
     ngx_http_sub_loc_conf_t   *slcf;
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_sub_filter_module);
 
-    if (ctx == NULL) {
-        return ngx_http_next_body_filter(r, in);
-    }
-
-    if ((in == NULL
-         && ctx->buf == NULL
-         && ctx->in == NULL
-         && ctx->busy == NULL))
-    {
-        return ngx_http_next_body_filter(r, in);
-    }
-
-    if (ctx->once && (ctx->buf == NULL || ctx->in == NULL)) {
-
-        if (ctx->busy) {
-            if (ngx_http_sub_output(r, ctx) == NGX_ERROR) {
-                return NGX_ERROR;
-            }
-        }
-
+    if (ctx == NULL || ctx->s == final_state) {
         return ngx_http_next_body_filter(r, in);
     }
 
     /* add the incoming chain to the chain ctx->in */
 
     if (in) {
-        if (ngx_chain_add_copy(r->pool, &ctx->in, in) != NGX_OK) {
-            return NGX_ERROR;
+        ngx_chain_t  *cl, **ll = ctx->last_in;
+
+        while (in) {
+            if (ctx->free) {
+                cl = ctx->free;
+                ctx->free = cl->next;
+
+            } else {
+                cl = ngx_alloc_chain_link(r->pool);
+                if (cl == NULL) {
+                    return NGX_ERROR;
+                }
+            }
+            cl->buf = in->buf;
+            *ll = cl;
+            ll = &cl->next;
+            in = in->next;
         }
+
+        *ll = NULL;
+        ctx->last_in = ll;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                    "http sub filter \"%V\"", &r->uri);
 
-    while (ctx->in || ctx->buf) {
+    slcf = ngx_http_get_module_loc_conf(r, ngx_http_sub_filter_module);
 
-        if (ctx->buf == NULL) {
-            ctx->buf = ctx->in->buf;
-            ctx->in = ctx->in->next;
-            ctx->pos = ctx->buf->pos;
-        }
+    while (1) {
 
-        if (ctx->state == sub_start_state) {
-            ctx->copy_start = ctx->pos;
-            ctx->copy_end = ctx->pos;
-        }
-
-        b = NULL;
-
-        while (ctx->pos < ctx->buf->last) {
-
-            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "saved: \"%V\" state: %d", &ctx->saved, ctx->state);
-
-            rc = ngx_http_sub_parse(r, ctx);
-
-            ngx_log_debug4(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                           "parse: %d, looked: \"%V\" %p-%p",
-                           rc, &ctx->looked, ctx->copy_start, ctx->copy_end);
-
-            if (rc == NGX_ERROR) {
-                return rc;
-            }
-
-            if (ctx->copy_start != ctx->copy_end) {
-
-                ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                               "saved: \"%V\"", &ctx->saved);
-
-                if (ctx->saved.len) {
-
-                    if (ctx->free) {
-                        cl = ctx->free;
-                        ctx->free = ctx->free->next;
-                        b = cl->buf;
-                        ngx_memzero(b, sizeof(ngx_buf_t));
-
-                    } else {
-                        b = ngx_calloc_buf(r->pool);
-                        if (b == NULL) {
-                            return NGX_ERROR;
-                        }
-
-                        cl = ngx_alloc_chain_link(r->pool);
-                        if (cl == NULL) {
-                            return NGX_ERROR;
-                        }
-
-                        cl->buf = b;
-                    }
-
-                    b->pos = ngx_pnalloc(r->pool, ctx->saved.len);
-                    if (b->pos == NULL) {
-                        return NGX_ERROR;
-                    }
-
-                    ngx_memcpy(b->pos, ctx->saved.data, ctx->saved.len);
-                    b->last = b->pos + ctx->saved.len;
-                    b->memory = 1;
-
-                    *ctx->last_out = cl;
-                    ctx->last_out = &cl->next;
-
-                    ctx->saved.len = 0;
+        switch (ctx->s) {
+        case init_state:
+            {
+                if (!ctx->in) {
+                    return NGX_OK;
                 }
+                ctx->in_pos = ctx->in->buf->pos;
+                ctx->s = accumulate_state;
+            }
+            /* fallthrough */
+        case accumulate_state:
+            {
+                size_t avail = ctx->in->buf->last - ctx->in_pos;
+                size_t capacity = ctx->cb_mask + 1 - (ctx->cb_end - ctx->cb_begin);
+                size_t xfer = (capacity <= avail ? capacity : avail);
+                size_t cont = ((ctx->cb_end + ctx->cb_mask) & ~ctx->cb_mask) - ctx->cb_end;
 
-                if (ctx->free) {
-                    cl = ctx->free;
-                    ctx->free = ctx->free->next;
-                    b = cl->buf;
-
+                /* copy xfer amount of data to cb from the buf */
+                if (xfer <= cont) {
+                    memcpy(
+                        &ctx->cb_p[ctx->cb_end & ctx->cb_mask], ctx->in_pos, xfer);
                 } else {
-                    b = ngx_alloc_buf(r->pool);
-                    if (b == NULL) {
-                        return NGX_ERROR;
-                    }
+                    memcpy(
+                        ctx->cb_p, ctx->in_pos + cont, xfer - cont);
+                    memcpy(
+                        &ctx->cb_p[ctx->cb_end & ctx->cb_mask], ctx->in_pos, cont);
+                }
+                ctx->cb_end += xfer;
+                ctx->in_pos += xfer;
 
-                    cl = ngx_alloc_chain_link(r->pool);
-                    if (cl == NULL) {
-                        return NGX_ERROR;
-                    }
-
-                    cl->buf = b;
+                /* cb full OR all buf data copied into cb AND buf is
+                 * the last in chain */
+                if (capacity <= avail || ctx->in->buf->last_buf) {
+                    ctx->s = search_state;
+                    continue;
                 }
 
-                ngx_memcpy(b, ctx->buf, sizeof(ngx_buf_t));
+                if (avail == 0) {
+                    ngx_chain_t *cl = ctx->in;
+                    cl->buf->pos = cl->buf->last;
+                    ctx->in = cl->next;
+                    cl->next = ctx->free;
+                    ctx->free = cl;
 
-                b->pos = ctx->copy_start;
-                b->last = ctx->copy_end;
-                b->shadow = NULL;
-                b->last_buf = 0;
-                b->recycled = 0;
+                    if (!ctx->in) {
+                        ctx->last_in = &ctx->in;
+                        ctx->s = init_state;
+                        return NGX_OK;
+                    }
 
-                if (b->in_file) {
-                    b->file_last = b->file_pos + (b->last - ctx->buf->pos);
-                    b->file_pos += b->pos - ctx->buf->pos;
+                    ctx->in_pos = ctx->in->buf->pos;
+                    continue;
                 }
 
-                cl->next = NULL;
-                *ctx->last_out = cl;
-                ctx->last_out = &cl->next;
-            }
-
-            if (ctx->state == sub_start_state) {
-                ctx->copy_start = ctx->pos;
-                ctx->copy_end = ctx->pos;
-
-            } else {
-                ctx->copy_start = NULL;
-                ctx->copy_end = NULL;
-            }
-
-            if (rc == NGX_AGAIN) {
                 continue;
             }
+        case search_state:
+            {
+                int i;
 
+                while (1) {
+                    if (ctx->search_pos == ctx->cb_end) {
+                        if (ctx->in_pos == ctx->in->buf->last && ctx->in->buf->last_buf) {
+                            ctx->s = (ctx->match_idx==-1 ? flush_cb_state : replace_state);
+                        } else {
+                            ctx->s = trim_cb_state;
+                        }
+                        break;
+                    }
 
-            /* rc == NGX_OK */
+                    i = ctx->fsm->dispatch[ctx->cb_p[ctx->search_pos & ctx->cb_mask]];
+                    ctx->fsm = ctx->fsm->links[i];
+                    ctx->search_pos++;
 
-            b = ngx_calloc_buf(r->pool);
-            if (b == NULL) {
-                return NGX_ERROR;
+                    if (i > 0) {
+                        if (ctx->fsm->match_idx != -1) {
+                            ctx->match_pos = ctx->search_pos;
+                            ctx->match_idx = ctx->fsm->match_idx;
+                        }
+                    } else {
+                        ctx->s = (ctx->match_idx == -1 ? fast_search_state : replace_state);
+                        break;
+                    }
+                }
+                continue;
             }
+        case fast_search_state:
+            {
+                /* searching linear memory */
+                u_char *base = &ctx->cb_p[ctx->search_pos & ctx->cb_mask];
+                u_char *i = base;
+                u_char *m = ctx->fsm->dispatch;
 
-            cl = ngx_alloc_chain_link(r->pool);
-            if (cl == NULL) {
-                return NGX_ERROR;
+                size_t remaining = ctx->cb_end - ctx->search_pos;
+                size_t cont = ((ctx->search_pos + ctx->cb_mask) & ~ctx->cb_mask) - ctx->search_pos;
+                u_char *e = base + (remaining <= cont ? remaining : cont);
+
+                /* the hotspot */
+                while (i<e && !m[*i]) {
+                    i++;
+                }
+                ctx->search_pos += (i - base);
+                ctx->s = search_state;
+                continue;
             }
+        case trim_cb_state:
+            {
+                if (ctx->cb_end - ctx->cb_begin > slcf->match_max) {
+                    if (!ngx_http_sub_output_cb(
+                            r, ctx, ctx->cb_end - slcf->match_max)) {
+                        return ctx->rc;
+                    }
+                }
+                ctx->s = accumulate_state;
+                continue;
+            }
+        case replace_state:
+            {
+                int match_idx = ctx->match_idx;
+                ngx_http_sub_match_t *m = slcf->matches->elts;
+                size_t end_pos = ctx->match_pos - m[match_idx].match.len;
 
-            slcf = ngx_http_get_module_loc_conf(r, ngx_http_sub_filter_module);
+                if (!ngx_http_sub_output_cb(r, ctx, end_pos)) {
+                    return ctx->rc;
+                }
+                ctx->cb_begin = ctx->match_pos;
 
-            if (ctx->sub.data == NULL) {
+                if (!ctx->subs) {
+                    size_t sz = slcf->matches->nelts * sizeof(ngx_str_t);
+                    ctx->subs = ngx_pcalloc(r->pool, sz);
+                    if (!ctx->subs) {
+                        return NGX_ERROR;
+                    }
+                }
 
-                if (ngx_http_complex_value(r, &slcf->value, &ctx->sub)
-                    != NGX_OK)
+                if (!ctx->subs[match_idx].data)
                 {
-                    return NGX_ERROR;
+                    if (ngx_http_complex_value(
+                            r, &m[match_idx].value, &ctx->subs[match_idx]) != NGX_OK) {
+                        return NGX_ERROR;
+                    }
                 }
+
+                ctx->s = repl_write_state;
+                ctx->repl_begin = ctx->subs[match_idx].data;
+                ctx->repl_end = ctx->repl_begin + ctx->subs[match_idx].len;
             }
+            /* fallthrough */
+        case repl_write_state:
+            {
+                ctx->repl_begin += ngx_http_sub_output(
+                    r, ctx, ctx->repl_begin, ctx->repl_end - ctx->repl_begin);
 
-            if (ctx->sub.len) {
-                b->memory = 1;
-                b->pos = ctx->sub.data;
-                b->last = ctx->sub.data + ctx->sub.len;
+                if (ctx->repl_begin != ctx->repl_end) {
+                    return ctx->rc;
+                }
 
-            } else {
-                b->sync = 1;
+                if (!slcf->once) {
+                    ctx->search_pos = ctx->cb_begin;
+                    ctx->match_idx = -1;
+                    ctx->s = accumulate_state;
+                    continue;
+                }
+
+                ctx->s = flush_cb_state;
             }
+            /* fallthrough */
+        case flush_cb_state:
+            {
+                ngx_buf_t *b;
+                ngx_chain_t *cl;
 
-            cl->buf = b;
-            cl->next = NULL;
-            *ctx->last_out = cl;
-            ctx->last_out = &cl->next;
+                if (!ngx_http_sub_output_cb(r, ctx, ctx->cb_end)) {
+                    return ctx->rc;
+                }
 
-            ctx->once = slcf->once;
+                if (ctx->obuf.pos == ctx->obuf.last) {
+                    ctx->obuf.sync = 1;
+                    ctx->obuf.memory = 0;
+                    ctx->obuf.recycled = 0;
+                }
 
-            continue;
-        }
-
-        if (ctx->buf->last_buf || ngx_buf_in_memory(ctx->buf)) {
-            if (b == NULL) {
-                if (ctx->free) {
-                    cl = ctx->free;
-                    ctx->free = ctx->free->next;
-                    b = cl->buf;
-                    ngx_memzero(b, sizeof(ngx_buf_t));
-
+                b = ctx->in->buf;
+                cl = &ctx->out;
+                if (ctx->in_pos == b->last) {
+                    cl->next = ctx->in->next;
+                    ctx->obuf.last_buf = b->last_buf;
                 } else {
-                    b = ngx_calloc_buf(r->pool);
-                    if (b == NULL) {
-                        return NGX_ERROR;
+                    cl->next = ctx->in;
+                    if (b->in_file) {
+                        b->file_pos += ctx->in_pos - b->pos;
                     }
-
-                    cl = ngx_alloc_chain_link(r->pool);
-                    if (cl == NULL) {
-                        return NGX_ERROR;
-                    }
-
-                    cl->buf = b;
                 }
+                b->pos = ctx->in_pos;
 
-                b->sync = 1;
-
-                cl->next = NULL;
-                *ctx->last_out = cl;
-                ctx->last_out = &cl->next;
+                ctx->s = final_state;
+                r->buffered &= ~NGX_HTTP_SUB_BUFFERED;
+                return ngx_http_next_body_filter(r, cl);
             }
-
-            b->last_buf = ctx->buf->last_buf;
-            b->shadow = ctx->buf;
-
-            b->recycled = ctx->buf->recycled;
         }
-
-        ctx->buf = NULL;
-
-        ctx->saved.len = ctx->looked.len;
-        ngx_memcpy(ctx->saved.data, ctx->looked.data, ctx->looked.len);
     }
-
-    if (ctx->out == NULL && ctx->busy == NULL) {
-        return NGX_OK;
-    }
-
-    return ngx_http_sub_output(r, ctx);
 }
 
 
-static ngx_int_t
-ngx_http_sub_output(ngx_http_request_t *r, ngx_http_sub_ctx_t *ctx)
+static size_t
+ngx_http_sub_output(ngx_http_request_t *r, ngx_http_sub_ctx_t *ctx,
+    u_char *p, size_t sz)
 {
-    ngx_int_t     rc;
-    ngx_buf_t    *b;
-    ngx_chain_t  *cl;
+    size_t avail;
+    ngx_buf_t *b = &ctx->obuf;
 
-#if 1
-    b = NULL;
-    for (cl = ctx->out; cl; cl = cl->next) {
-        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
-                       "sub out: %p %p", cl->buf, cl->buf->pos);
-        if (cl->buf == b) {
-            ngx_log_error(NGX_LOG_ALERT, r->connection->log, 0,
-                          "the same buf was used in sub");
-            ngx_debug_point();
-            return NGX_ERROR;
-        }
-        b = cl->buf;
-    }
-#endif
-
-    rc = ngx_http_next_body_filter(r, ctx->out);
-
-    if (ctx->busy == NULL) {
-        ctx->busy = ctx->out;
-
-    } else {
-        for (cl = ctx->busy; cl->next; cl = cl->next) { /* void */ }
-        cl->next = ctx->out;
+    if (ctx->rc == NGX_ERROR) {
+        return 0;
     }
 
-    ctx->out = NULL;
-    ctx->last_out = &ctx->out;
-
-    while (ctx->busy) {
-
-        cl = ctx->busy;
-        b = cl->buf;
-
-        if (ngx_buf_size(b) != 0) {
-            break;
-        }
-
-        if (b->shadow) {
-            b->shadow->pos = b->shadow->last;
-        }
-
-        ctx->busy = cl->next;
-
-        if (ngx_buf_in_memory(b) || b->in_file) {
-            /* add data bufs only to the free buf chain */
-
-            cl->next = ctx->free;
-            ctx->free = cl;
-        }
-    }
-
-    if (ctx->in || ctx->buf) {
-        r->buffered |= NGX_HTTP_SUB_BUFFERED;
-
-    } else {
-        r->buffered &= ~NGX_HTTP_SUB_BUFFERED;
-    }
-
-    return rc;
-}
-
-
-static ngx_int_t
-ngx_http_sub_parse(ngx_http_request_t *r, ngx_http_sub_ctx_t *ctx)
-{
-    u_char                *p, *last, *copy_end, ch, match;
-    size_t                 looked;
-    ngx_http_sub_state_e   state;
-
-    if (ctx->once) {
-        ctx->copy_start = ctx->pos;
-        ctx->copy_end = ctx->buf->last;
-        ctx->pos = ctx->buf->last;
-        ctx->looked.len = 0;
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "once");
-
-        return NGX_AGAIN;
-    }
-
-    state = ctx->state;
-    looked = ctx->looked.len;
-    last = ctx->buf->last;
-    copy_end = ctx->copy_end;
-
-    for (p = ctx->pos; p < last; p++) {
-
-        ch = *p;
-        ch = ngx_tolower(ch);
-
-        if (state == sub_start_state) {
-
-            /* the tight loop */
-
-            match = ctx->match.data[0];
-
-            for ( ;; ) {
-                if (ch == match) {
-                    copy_end = p;
-                    ctx->looked.data[0] = *p;
-                    looked = 1;
-                    state = sub_match_state;
-
-                    goto match_started;
-                }
-
-                if (++p == last) {
-                    break;
-                }
-
-                ch = *p;
-                ch = ngx_tolower(ch);
-            }
-
-            ctx->state = state;
-            ctx->pos = p;
-            ctx->looked.len = looked;
-            ctx->copy_end = p;
-
-            if (ctx->copy_start == NULL) {
-                ctx->copy_start = ctx->buf->pos;
-            }
-
-            return NGX_AGAIN;
-
-        match_started:
-
-            continue;
-        }
-
-        /* state == sub_match_state */
-
-        if (ch == ctx->match.data[looked]) {
-            ctx->looked.data[looked] = *p;
-            looked++;
-
-            if (looked == ctx->match.len) {
-                if ((size_t) (p - ctx->pos) < looked) {
-                    ctx->saved.len = 0;
-                }
-
-                ctx->state = sub_start_state;
-                ctx->pos = p + 1;
-                ctx->looked.len = 0;
-                ctx->copy_end = copy_end;
-
-                if (ctx->copy_start == NULL && copy_end) {
-                    ctx->copy_start = ctx->buf->pos;
-                }
-
-                return NGX_OK;
-            }
-
-        } else if (ch == ctx->match.data[0]) {
-            copy_end = p;
-            ctx->looked.data[0] = *p;
-            looked = 1;
-
+    if (ctx->busy) {
+        if (b->pos == b->last) {
+            ctx->busy = 0;
+            b->pos = b->last = b->start;
         } else {
-            copy_end = p;
-            looked = 0;
-            state = sub_start_state;
+            return 0;
         }
     }
 
-    ctx->state = state;
-    ctx->pos = p;
-    ctx->looked.len = looked;
-
-    ctx->copy_end = (state == sub_start_state) ? p : copy_end;
-
-    if (ctx->copy_start == NULL && ctx->copy_end) {
-        ctx->copy_start = ctx->buf->pos;
+    avail = b->end - b->last;
+    if (sz > avail) {
+        memcpy(b->last, p, avail);
+        b->last += avail;
+        ctx->busy = 1;
+        ctx->rc = ngx_http_next_body_filter(r, &ctx->out);
+        return avail;
     }
 
-    return NGX_AGAIN;
+    memcpy(b->last, p, sz);
+    b->last += sz;
+    return sz;
+}
+
+
+static int
+ngx_http_sub_output_cb(ngx_http_request_t *r, ngx_http_sub_ctx_t *ctx,
+    size_t end_pos)
+{
+    size_t split_pt = (ctx->cb_begin + ctx->cb_mask) & ~ctx->cb_mask;
+
+    if (split_pt - ctx->cb_begin < end_pos - ctx->cb_begin) {
+        ctx->cb_begin += ngx_http_sub_output(
+            r, ctx,
+            &ctx->cb_p[ctx->cb_begin & ctx->cb_mask],
+            split_pt - ctx->cb_begin);
+        ctx->cb_begin += ngx_http_sub_output(r, ctx, ctx->cb_p, end_pos - split_pt);
+    } else {
+        ctx->cb_begin += ngx_http_sub_output(
+            r, ctx,
+            &ctx->cb_p[ctx->cb_begin & ctx->cb_mask],
+            end_pos - ctx->cb_begin);
+    }
+    return ctx->cb_begin == end_pos;
 }
 
 
@@ -625,24 +568,45 @@ ngx_http_sub_filter(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_sub_loc_conf_t *slcf = conf;
 
+    ngx_array_t                       *matches;
+    ngx_http_sub_match_t              *m;
+    size_t                             i;
     ngx_str_t                         *value;
     ngx_http_compile_complex_value_t   ccv;
 
-    if (slcf->match.data) {
-        return "is duplicate";
+    matches = slcf->matches;
+    if (matches == NULL) {
+        matches = ngx_array_create(cf->pool, 1, sizeof(ngx_http_sub_match_t));
+        if (matches == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        slcf->matches = matches;
     }
 
     value = cf->args->elts;
 
     ngx_strlow(value[1].data, value[1].data, value[1].len);
 
-    slcf->match = value[1];
+    m = matches->elts;
+    for (i = 0; i < matches->nelts; i++) {
+        if (m[i].match.len == value[1].len
+            && memcmp(m[i].match.data, value[1].data, value[1].len)==0) {
+            return "is duplicate";
+        }
+    }
+
+    m = ngx_array_push(matches);
+    if (!m) {
+        return NGX_CONF_ERROR;
+    }
+
+    m->match = value[1];
 
     ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
 
     ccv.cf = cf;
     ccv.value = &value[2];
-    ccv.complex_value = &slcf->value;
+    ccv.complex_value = &m->value;
 
     if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
         return NGX_CONF_ERROR;
@@ -665,12 +629,11 @@ ngx_http_sub_create_conf(ngx_conf_t *cf)
     /*
      * set by ngx_pcalloc():
      *
-     *     conf->match = { 0, NULL };
-     *     conf->sub = { 0, NULL };
-     *     conf->sub_lengths = NULL;
-     *     conf->sub_values = NULL;
+     *     conf->matches = NULL;
      *     conf->types = { NULL };
      *     conf->types_keys = NULL;
+     *     conf->fsm = NULL;
+     *     conf->match_max = 0;
      */
 
     slcf->once = NGX_CONF_UNSET;
@@ -686,10 +649,34 @@ ngx_http_sub_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_sub_loc_conf_t *conf = child;
 
     ngx_conf_merge_value(conf->once, prev->once, 1);
-    ngx_conf_merge_str_value(conf->match, prev->match, "");
 
-    if (conf->value.value.data == NULL) {
-        conf->value = prev->value;
+    if (!conf->matches && prev->matches) {
+        conf->matches = prev->matches;
+    }
+
+    if (conf->matches) {
+        ngx_array_t *matches = conf->matches;
+        ngx_str_t *patterns;
+        ngx_http_sub_match_t *m;
+        size_t i;
+
+        patterns = ngx_palloc(cf->temp_pool, matches->nelts * sizeof(ngx_str_t));
+        if (!patterns) {
+            return NGX_CONF_ERROR;
+        }
+
+        m = matches->elts;
+        for (i = 0; i < matches->nelts; i++) {
+            patterns[i] = m[i].match;
+            if (m[i].match.len > conf->match_max) {
+                conf->match_max = m[i].match.len;
+            }
+        }
+
+        conf->fsm = ngx_http_sub_compile(cf, patterns, matches->nelts);
+        if (!conf->fsm) {
+            return NGX_CONF_ERROR;
+        }
     }
 
     if (ngx_http_merge_types(cf, &conf->types_keys, &conf->types,
@@ -714,4 +701,221 @@ ngx_http_sub_filter_init(ngx_conf_t *cf)
     ngx_http_top_body_filter = ngx_http_sub_body_filter;
 
     return NGX_OK;
+}
+
+
+/*
+ * FSM compiler
+ */
+
+typedef struct {
+    int                        idx;
+    int                        pos;
+
+} ngx_http_sub_meta_slot_t;
+
+
+typedef struct {
+    size_t                     len;
+    ngx_http_sub_meta_slot_t   slots[1];
+
+} ngx_http_sub_meta_t;
+
+#define NGX_HTTP_SUB_META_SIZE(n) \
+(offsetof(ngx_http_sub_meta_t, slots) \
+    + (n) * sizeof(ngx_http_sub_meta_slot_t))
+
+
+typedef struct ngx_http_sub_info_s {
+    ngx_http_sub_fsm_t        *fsm;
+    struct ngx_http_sub_info_s
+                              *next;
+    uint32_t                   meta_hash;
+    ngx_http_sub_meta_t        meta;
+
+} ngx_http_sub_info_t;
+
+#define NGX_HTTP_SUB_INFO_SIZE(m) \
+(offsetof(ngx_http_sub_info_t, meta) \
+    + NGX_HTTP_SUB_META_SIZE((m)->len))
+
+
+typedef struct {
+    ngx_conf_t                *conf;
+    ngx_str_t                 *patterns;
+    ngx_http_sub_fsm_t        *fsm;
+    ngx_http_sub_meta_t       *meta;
+#define NGX_HTTP_SUB_COMPILE_BUCKETS 113
+    ngx_http_sub_info_t       *buckets[NGX_HTTP_SUB_COMPILE_BUCKETS];
+    int                        next_fsm_id;
+    u_char                     bitmap[256];
+
+} ngx_http_sub_compile_t;
+
+
+static ngx_int_t
+ngx_http_sub_compile2(ngx_http_sub_compile_t *c, ngx_http_sub_fsm_t **pfsm)
+{
+    size_t i;
+    ngx_http_sub_info_t *info, **pi;
+    uint32_t meta_hash;
+    int pos_filter = 0;
+    int match_idx = -1;
+    size_t n_links = 1;
+    ngx_http_sub_fsm_t *fsm;
+
+    meta_hash = ngx_murmur_hash2(
+        (u_char *)c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len));
+
+    /* search for existing fsm */
+    pi = &c->buckets[meta_hash % NGX_HTTP_SUB_COMPILE_BUCKETS];
+    info = *pi;
+    while (info) {
+        if (info->meta_hash == meta_hash
+            && memcmp(&info->meta, c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len))==0) {
+
+            *pfsm = info->fsm;
+            return NGX_OK;
+        }
+        pi = &info->next;
+        info = info->next;
+    }
+
+    /* build new fsm */
+    *pi = info = ngx_palloc(c->conf->temp_pool, NGX_HTTP_SUB_INFO_SIZE(c->meta));
+    if (!info) {
+        return NGX_ERROR;
+    }
+
+    info->meta_hash = meta_hash;
+    memcpy(&info->meta, c->meta, NGX_HTTP_SUB_META_SIZE(c->meta->len));
+
+    /* check if there is a match in the current state */
+    for (i = 0; i < info->meta.len; i++) {
+        ngx_http_sub_meta_slot_t slot = info->meta.slots[i];
+        if (slot.pos == c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+            match_idx = slot.idx;
+            pos_filter = slot.pos;
+        }
+    }
+
+    /* find accepted characters */
+    memset(c->bitmap, 0, sizeof c->bitmap);
+    for (i = 0; i < info->meta.len; i++) {
+        ngx_http_sub_meta_slot_t slot = info->meta.slots[i];
+        if (slot.pos != c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+            c->bitmap[c->patterns[slot.idx].data[slot.pos]] = 1;
+        }
+    }
+
+    /* count outgoing links */
+    for (i = 0; i < 256; i++) {
+        n_links += c->bitmap[i];
+    }
+
+    /* allocate fsm */
+    fsm = ngx_pcalloc(c->conf->pool, NGX_HTTP_SUB_FSM_SIZE(n_links));
+    *pfsm = info->fsm = fsm;
+    if (!fsm) {
+        return NGX_ERROR;
+    }
+
+    /* init fsm */
+#ifdef NGX_HTTP_SUB_FSM_ID
+    fsm->id = c->next_fsm_id++;
+#endif
+    fsm->match_idx = match_idx;
+    fsm->links[0] = c->fsm;
+    n_links = 1;
+
+#if NGX_DEBUG
+    if (match_idx != -1) {
+        fprintf(stderr, "%d[shape=doublecircle];\n", fsm->id);
+    }
+#endif
+
+    /* init dispatch table */
+    for (i = 0; i< 256; i++) {
+        if (c->bitmap[i]) {
+            fsm->dispatch[i] = n_links++;
+        }
+    }
+
+    /* init links */
+    for (i = 0; i< 256; i++) {
+        if (fsm->dispatch[i]) {
+            size_t j;
+
+            c->meta->len = 0;
+            for (j = 0; j < info->meta.len; j++) {
+                ngx_http_sub_meta_slot_t slot = info->meta.slots[j];
+                if (slot.pos != c->patterns[slot.idx].len && slot.pos >= pos_filter) {
+                    if (slot.pos == 0) {
+                        c->meta->slots[c->meta->len++] = slot;
+                    }
+                    if (c->patterns[slot.idx].data[slot.pos] == i) {
+                        ngx_http_sub_meta_slot_t slot2 = {slot.idx, slot.pos + 1};
+                        c->meta->slots[c->meta->len++] = slot2;
+                    }
+                }
+            }
+
+            if (ngx_http_sub_compile2(
+                    c, &fsm->links[fsm->dispatch[i]]) != NGX_OK) {
+                return NGX_ERROR;
+            }
+#if NGX_DEBUG
+            fprintf(stderr, "%d->%d [label=%c];\n", fsm->id, fsm->links[fsm->dispatch[i]]->id, (int)i);
+#endif
+        }
+    }
+
+    /* modify dispatch table for case-insensitive matching */
+    for (i = 0; i< 256; i++) {
+        if (fsm->dispatch[i]) {
+            fsm->dispatch[ngx_tolower(i)] = fsm->dispatch[i];
+            fsm->dispatch[ngx_toupper(i)] = fsm->dispatch[i];
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+static ngx_http_sub_fsm_t *
+ngx_http_sub_compile(ngx_conf_t *conf, ngx_str_t *patterns, size_t n)
+{
+    ngx_http_sub_compile_t c = {conf, patterns};
+
+    size_t slots_max = n;
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        slots_max += patterns[i].len;
+    }
+
+    c.meta = ngx_palloc(conf->temp_pool, NGX_HTTP_SUB_META_SIZE(slots_max));
+    if (!c.meta) {
+        return NULL;
+    }
+
+    c.meta->len = n;
+    for (i = 0; i < n; i++) {
+        c.meta->slots[i].idx = i;
+        c.meta->slots[i].pos = 0;
+    }
+
+#if NGX_DEBUG
+    fprintf(stderr, "digraph D {\nnode[shape=circle];\n");
+#endif
+
+    if (ngx_http_sub_compile2(&c, &c.fsm) != NGX_OK) {
+        return NULL;
+    }
+
+#if NGX_DEBUG
+    fprintf(stderr, "}\n");
+#endif
+
+    return c.fsm;
 }
